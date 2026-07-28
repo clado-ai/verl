@@ -908,23 +908,41 @@ def contiguous(data: TensorDict) -> TensorDict:
 
 
 def maybe_fix_3d_position_ids(data: TensorDict):
-    # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
-    # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
-    # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
+    # 3d (mrope) position ids must reach the no-padding forward ragged over the sequence axis, so that
+    # position_ids.values() is (rows, total_nnz). two distinct defects break that, and they need
+    # different repairs. both present as _ragged_idx == 1.
     #
-    # only restore the ragged dim when it was actually lost. when every sequence in the batch has the
-    # same length, torch legitimately builds the nested tensor ragged over dim 1 -- shape (bs, j, rows)
-    # with a (bs * rows, seq_len) values buffer -- and forcing _ragged_idx = 2 relabels the axes without
-    # moving any data, so downstream unpacking reads the mrope rows as positions.
+    # 1. serialization. a nested tensor in a tensordict loses _ragged_idx across consolidate and
+    #    pickle/unpickle (a tensordict bug). the values buffer is still the correct (rows, total_nnz);
+    #    only the label is gone, so restoring _ragged_idx = 2 is sufficient.
     #
-    # the two cases are told apart by the jagged offsets, which are never rewritten by the roundtrip:
-    # offsets[-1] must equal the size of the values buffer along the ragged dim. that identity holds for
-    # a genuinely dim-1-ragged batch and is violated exactly when the ragged dim was silently reset to 1.
-    if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        position_ids = data["position_ids"]
-        ragged_idx = position_ids._ragged_idx
-        if ragged_idx == 1 and int(position_ids.offsets()[-1]) != position_ids.values().shape[ragged_idx - 1]:
-            data["position_ids"]._ragged_idx = 2
+    # 2. construction. torch infers the ragged axis from the first dimension that varies across the
+    #    input list. when every sequence in the batch has the same length, nothing varies along the
+    #    seq axis, so it picks the row axis instead and backs the tensor with (bs * rows, seq_len).
+    #    here the buffer itself is wrong: relabeling only renames the axes and leaves the rows
+    #    interleaved, which silently feeds mrope garbage instead of raising. the values have to be
+    #    rebuilt by concatenating each sequence along the seq axis.
+    #
+    # the offsets tell the two apart, because they are never rewritten by either defect: offsets[-1]
+    # equals the values buffer's size along the true ragged axis. after a lost label that identity
+    # still holds (both are total_nnz); after a mis-inferred construction it does not (offsets[-1] is
+    # bs * rows while the buffer's leading dim is seq_len).
+    if "position_ids" not in data.keys():
+        return
+    position_ids = data["position_ids"]
+    if position_ids.dim() != 3 or not position_ids.is_nested or position_ids._ragged_idx != 1:
+        return
+
+    if int(position_ids.offsets()[-1]) != position_ids.values().shape[0]:
+        data["position_ids"]._ragged_idx = 2
+        return
+
+    sequences = list(position_ids.unbind(0))
+    values = torch.cat(sequences, dim=-1)
+    lengths = torch.tensor([seq.shape[-1] for seq in sequences], dtype=torch.long, device=values.device)
+    offsets = torch.zeros(len(sequences) + 1, dtype=torch.long, device=values.device)
+    torch.cumsum(lengths, dim=0, out=offsets[1:])
+    data["position_ids"] = torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets, jagged_dim=2)
 
 
 def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:
