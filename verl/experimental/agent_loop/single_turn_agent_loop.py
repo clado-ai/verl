@@ -92,6 +92,15 @@ class SingleTurnAgentLoop(AgentLoopBase):
             response_mask = [1] * len(output.token_ids)
             response_logprobs = output.log_probs
 
+        # a completion cut off at max_response_length was never finished by the policy, so training on
+        # it teaches the model to imitate an arbitrary truncation point. zero the whole mask so the
+        # sequence contributes nothing to the loss. applied after both branches above so the
+        # continuous-token path is covered too. off by default; opt in via mask_truncated_completions.
+        if self.rollout_config.get("mask_truncated_completions", False) and (
+            output.extra_fields.get("finish_reason") == "length"
+        ):
+            response_mask = [0] * len(response_mask)
+
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],

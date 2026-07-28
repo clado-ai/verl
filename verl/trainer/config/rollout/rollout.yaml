@@ -48,6 +48,9 @@ gpu_memory_utilization: 0.5
 # Whether to ignore EOS and continue generating after EOS is hit.
 ignore_eos: False
 
+# whether to exclude length-truncated completions from the training loss.
+mask_truncated_completions: false
+
 # Whether to disable CUDA graph. Default False to best performance.
 enforce_eager: False
 
