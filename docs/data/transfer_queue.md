@@ -1,13 +1,13 @@
 # TransferQueue Data System
 
-Last updated: 05/15/2026.
+Last updated: 06/08/2026.
 
 This doc introduce [TransferQueue](https://github.com/Ascend/TransferQueue), an asynchronous streaming data management system for efficient post-training.
 
-🔥 **Now TransferQueue is open-sourced at both [Github](https://github.com/Ascend/TransferQueue) and [GitCode](https://gitcode.com/Ascend/TransferQueue). <span style="color: #FF0000;">You are welcome to submit contributions or propose new ideas on either platform!**</span>
+🔥 **Now TransferQueue is open-sourced at both [GitHub](https://github.com/Ascend/TransferQueue) and [GitCode](https://gitcode.com/Ascend/TransferQueue). <span style="color: #FF0000;">You are welcome to submit contributions or propose new ideas on either platform!**</span>
 
 
-> At the mean time, the early development history remains accessible at: https://github.com/TransferQueue/TransferQueue.
+> In the meantime, the early development history remains accessible at [TransferQueue/TransferQueue](https://github.com/TransferQueue/TransferQueue).
 
 <h2 id="overview"> Overview</h2>
 
@@ -71,9 +71,9 @@ This class encapsulates the core interaction logic within the TransferQueue syst
 Currently, we support the following storage backends:
 
 - SimpleStorage: A basic CPU memory storage with minimal data format constraints and ease of use.
-- [Yuanrong](https://gitee.com/openeuler/yuanrong-datasystem) (beta, [#PR107](https://github.com/TransferQueue/TransferQueue/pull/107), [#PR96](https://github.com/TransferQueue/TransferQueue/pull/96)): An Ascend native data system that provides hierarchical storage interfaces including HBM/DRAM/SSD.
+- [Yuanrong](https://gitee.com/openeuler/yuanrong-datasystem) ([usage guide](https://github.com/Ascend/TransferQueue/blob/main/docs/storage_backends/openyuanrong_datasystem.md), beta, [#PR107](https://github.com/TransferQueue/TransferQueue/pull/107), [#PR96](https://github.com/TransferQueue/TransferQueue/pull/96)): An Ascend native data system that provides hierarchical storage interfaces including HBM/DRAM/SSD.
 - [MooncakeStore](https://github.com/kvcache-ai/Mooncake) (beta, [#PR162](https://github.com/TransferQueue/TransferQueue/pull/162)): A high-performance, KV-based hierarchical storage that supports RDMA transport between GPU and DRAM.
-- [RayRDT](https://docs.ray.io/en/master/ray-core/direct-transport.html) (alpha, [#PR167](https://github.com/TransferQueue/TransferQueue/pull/167)): Ray's new feature that allows Ray to store and pass objects directly between Ray actors.
+- [RayRDT](https://docs.ray.io/en/master/ray-core/direct-transport/direct-transport.html) (alpha, [#PR167](https://github.com/TransferQueue/TransferQueue/pull/167)): Ray's new feature that allows Ray to store and pass objects directly between Ray actors.
 
 Among them, `SimpleStorageUnit` serves as our default storage backend, coordinated by the `AsyncSimpleStorageManager` class. Each storage unit can be deployed on a separate node, allowing for distributed data management.
 
@@ -158,7 +158,7 @@ We have experimentally implemented a **standardized, fully-streamed distributed*
 
 By leveraging the `RankAwareSampler` and `StreamingDataLoader` interfaces, we achieve a **streamlined micro-batch-level producer-consumer pipeline**. This design eliminates the need to manually determine data dispatching logic across varying parallelism strategies—a typical complexity in the single-controller paradigm—thereby greatly simplifying framework design. 
 
-Please refer to our [Roadmap](https://github.com/Ascend/TransferQueue/issues/1) and [tutorials/05_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/05_streaming_dataloader.py) for more details.
+Please refer to our [Roadmap](https://github.com/Ascend/TransferQueue/issues/1) and [tutorials/06_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/06_streaming_dataloader.py) for more details.
 
 <p align="center">
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/tq_streaming_dataloader.png?raw=true" width="70%">
@@ -205,21 +205,22 @@ pip install TransferQueue
 
 <h2 id="performance">📊 Performance</h2>
 
-### Simple Case: Regular Tensor Only
+### Simple Case: Regular Tensor
 <p align="center">
-  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_simple_0.1.6.png?raw=true" width="100%">
+  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_simple_0.1.8.png?raw=true" width="100%">
 </p>
 
 ### Complex Case: Regular Tensor + NestedTensor + NonTensor
 <p align="center">
-  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_complex_0.1.6.png?raw=true" width="100%">
+  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_complex_0.1.8.png?raw=true" width="100%">
 </p>
 
-> Note: Optimization for MooncakeStore and other backends are still in process. Warmly welcome contributions from the community!
+> Note: The openYuanrong benchmark uses only a single NPU, so it doesn't reflect multi-NPU scalability. Additionally, openYuanrong was tested on a different hardware setup than the other backends.
 
-For detailed performance benchmarks, please refer to [this blog](https://www.yuque.com/haomingzi-lfse7/lhp4el/tml8ke0zkgn6roey?singleDoc#).
+For detailed performance benchmarks, please refer to [the full benchmark report](https://www.yuque.com/haomingzi-lfse7/lhp4el/mywsxovevynra42u?singleDoc#).
 
-We also provide a [stress test report](https://www.yuque.com/haomingzi-lfse7/lhp4el/mt0vedqy7c337pgg?singleDoc#) that demonstrates more than **8192 concurrent clients writing 2 TB of data** into TransferQueue across 4 nodes. The system remains stable without any crashes or data loss.
+### Stress Test
+Beyond throughput, we also validated stability under high concurrency. We provide a [stress test report](https://www.yuque.com/haomingzi-lfse7/lhp4el/mt0vedqy7c337pgg?singleDoc#) that demonstrates more than **8192 concurrent clients writing 2 TB of data** into TransferQueue across 4 nodes. The system remains stable without any crashes or data loss.
 
 <h2 id="customize"> 🛠️ Customize TransferQueue</h2>
 

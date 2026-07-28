@@ -40,8 +40,10 @@ class _FakeServerManager:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        priority: int = 0,
     ) -> TokenOutput:
-        del request_id, prompt_ids, sampling_params, image_data, video_data, audio_data, mm_processor_kwargs
+        del request_id, prompt_ids, sampling_params, image_data, video_data, audio_data
+        del mm_processor_kwargs, priority
         return TokenOutput(
             token_ids=[11, 12, 13],
             log_probs=[0.0, 0.0, 0.0],
@@ -80,7 +82,11 @@ def _make_agent_loop(mask_truncated_completions: bool) -> SingleTurnAgentLoop:
                 },
                 "model": {},
             },
-            "data": {"tool_config_path": None, "apply_chat_template_kwargs": {}},
+            "data": {
+                "tool_config_path": None,
+                "apply_chat_template_kwargs": {},
+                "continuous_token": {"enable": False, "model_family": None},
+            },
         }
     )
     return SingleTurnAgentLoop(
@@ -131,12 +137,21 @@ async def test_vllm_finish_reason_survives_in_extra_fields(finish_reason: str):
             "response_length": 8,
             "repetition_penalty": 1.0,
             "enable_rollout_routing_replay": False,
+            "full_determinism": False,
             "mtp": None,
         }
     )
     server.model_config = SimpleNamespace(processor=None, lora_rank=0, lora={})
     server.engine = _FakeEngine(finish_reason)
     server.global_steps = 7
+    server.replica_rank = 0
+    server._warned_missing_spec_decode_stats = False
+    # the prefill/decode disaggregation branch short-circuits generate() before the finish_reason
+    # block; keep it off so this test exercises the normal path.
+    server._disaggregation_role = None
+    server._disaggregation_kv_transfer_config = None
+    server._pd_decode_peers = None
+    server._pd_peer_idx = 0
 
     output = await server.generate(prompt_ids=[1, 2], sampling_params={}, request_id="request-id")
 
