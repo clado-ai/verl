@@ -64,7 +64,20 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
         else:  # (4, seq_len)
             valid_ids = curr_pos_ids[:, curr_mask]
         position_ids_list.append(valid_ids)
-    position_ids_nested = torch.nested.as_nested_tensor(position_ids_list, layout=torch.jagged)
+    if position_ids.dim() == 3:
+        # torch infers the ragged dim from the first axis that varies across the list. when every
+        # sequence in the batch has the same length, nothing varies along the seq axis, so it picks
+        # the row axis instead and backs the tensor with (bs * 4, seq_len). the no-padding forward in
+        # workers/engine/fsdp/transformer_impl.py reads position_ids.values() as (4, total_nnz), and
+        # transformers only strips the leading text row when shape[0] == 4, so the mismatched buffer
+        # reaches mrope with bs * 4 rows and the rope matmul fails. pin the seq axis explicitly.
+        # this is construction-side: maybe_fix_3d_position_ids cannot repair it, because setting
+        # _ragged_idx only relabels the axes and leaves the (bs * 4, seq_len) buffer in place.
+        position_ids_nested = torch.nested.nested_tensor_from_jagged(
+            torch.cat(position_ids_list, dim=-1), offsets=cu_seqlens, jagged_dim=2
+        )
+    else:
+        position_ids_nested = torch.nested.as_nested_tensor(position_ids_list, layout=torch.jagged)
 
     data["input_ids"] = input_ids_nested
     data["position_ids"] = position_ids_nested
