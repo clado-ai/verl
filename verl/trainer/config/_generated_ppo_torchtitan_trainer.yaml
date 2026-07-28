@@ -241,6 +241,7 @@ actor_rollout_ref:
     dtype: bfloat16
     gpu_memory_utilization: 0.5
     ignore_eos: false
+    mask_truncated_completions: false
     enforce_eager: false
     cudagraph_capture_sizes: null
     free_cache_engine: true

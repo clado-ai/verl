@@ -191,6 +191,7 @@ class RolloutConfig(BaseConfig):
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
     ignore_eos: bool = False
+    mask_truncated_completions: bool = False
     enforce_eager: bool = False
     cudagraph_capture_sizes: Optional[list] = None
     free_cache_engine: bool = True

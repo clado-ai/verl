@@ -572,6 +572,7 @@ class vLLMHttpServer:
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
+        extra_fields["finish_reason"] = finish_reason
         if finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):
