@@ -911,8 +911,20 @@ def maybe_fix_3d_position_ids(data: TensorDict):
     # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
     # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
     # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
+    #
+    # only restore the ragged dim when it was actually lost. when every sequence in the batch has the
+    # same length, torch legitimately builds the nested tensor ragged over dim 1 -- shape (bs, j, rows)
+    # with a (bs * rows, seq_len) values buffer -- and forcing _ragged_idx = 2 relabels the axes without
+    # moving any data, so downstream unpacking reads the mrope rows as positions.
+    #
+    # the two cases are told apart by the jagged offsets, which are never rewritten by the roundtrip:
+    # offsets[-1] must equal the size of the values buffer along the ragged dim. that identity holds for
+    # a genuinely dim-1-ragged batch and is violated exactly when the ragged dim was silently reset to 1.
     if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        data["position_ids"]._ragged_idx = 2
+        position_ids = data["position_ids"]
+        ragged_idx = position_ids._ragged_idx
+        if ragged_idx == 1 and int(position_ids.offsets()[-1]) != position_ids.values().shape[ragged_idx - 1]:
+            data["position_ids"]._ragged_idx = 2
 
 
 def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:
