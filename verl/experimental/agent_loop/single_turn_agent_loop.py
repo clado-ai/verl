@@ -68,7 +68,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
-        response_mask = [1] * len(output.token_ids)
+        mask_truncated = self.rollout_config.get("mask_truncated_completions", False)
+        is_truncated = output.extra_fields.get("finish_reason") == "length"
+        response_mask_value = 0 if mask_truncated and is_truncated else 1
+        response_mask = [response_mask_value] * len(output.token_ids)
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
