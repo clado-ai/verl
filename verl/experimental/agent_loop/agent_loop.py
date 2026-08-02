@@ -390,6 +390,32 @@ def register(agent_name: str):
     return decorator
 
 
+def _pad_position_ids(all_position_ids: list[torch.Tensor]) -> torch.Tensor:
+    """Right-pad per-sample position ids to a common seq len, for 1d and mrope 3d alike.
+
+    ``pad_sequence`` pads dim 0 and requires every trailing dim to match already. That holds for
+    the 1d text case ``(seq,)``, where the ragged axis IS dim 0. It does not hold for the mrope
+    case: ``_compute_position_ids`` returns ``(1, 4, seq)`` and the caller squeezes it to
+    ``(4, seq)``, so the ragged axis is dim 1 while dim 0 is the uniform section count. Feeding
+    those to ``pad_sequence`` pads the 4 and asserts on the seq len -- inverted, and unsatisfiable:
+    any two turns of unequal length raise, which is the normal state of a multi-turn rollout.
+
+    Transposing to ``(seq, 4)`` puts the ragged axis back on dim 0, so ``pad_sequence`` does the
+    right thing, and transposing the result back yields ``(bs, 4, seq)`` -- exactly what
+    ``workers/utils/padding.py`` documents at :47 and branches on at :67 (``position_ids.dim() ==
+    3``). The 1d path is left on ``pad_sequence`` directly rather than routed through the transpose,
+    so the overwhelmingly common text-only case keeps its existing code path byte for byte.
+    """
+    if not all_position_ids:
+        return torch.nn.utils.rnn.pad_sequence(all_position_ids, batch_first=True, padding_value=0)
+    if all_position_ids[0].dim() == 1:
+        return torch.nn.utils.rnn.pad_sequence(all_position_ids, batch_first=True, padding_value=0)
+    # (n_sections, seq) -> (seq, n_sections), pad the now-leading ragged axis, then restore.
+    transposed = [p.transpose(0, 1) for p in all_position_ids]
+    padded = torch.nn.utils.rnn.pad_sequence(transposed, batch_first=True, padding_value=0)
+    return padded.transpose(1, 2)
+
+
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop.
 
@@ -876,9 +902,7 @@ class AgentLoopWorker:
                             all_attention_mask, batch_first=True, padding_value=0
                         ),
                         "input_ids": torch.nn.utils.rnn.pad_sequence(all_input_ids, batch_first=True, padding_value=0),
-                        "position_ids": torch.nn.utils.rnn.pad_sequence(
-                            all_position_ids, batch_first=True, padding_value=0
-                        ),
+                        "position_ids": _pad_position_ids(all_position_ids),
                     },
                     batch_size=n,
                 )
