@@ -105,9 +105,10 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
             assert input_ids.ndim == 2, f"input_ids shape doesn't match, {hidden_states.shape} {input_ids.shape}"
             orig_batch_size = hidden_states.shape[0]
             hidden_states = hidden_states.flatten(0, 1)
-            input_ids = input_ids.flatten(0, 1)
+        input_ids = input_ids.flatten()
 
         T = hidden_states.shape[0]
+        assert input_ids.shape == (T,), f"input_ids shape doesn't match, {hidden_states.shape} {input_ids.shape}"
 
         # Allocate memory for outputs
         output_requires_grad = hidden_states.requires_grad or vocab_weights.requires_grad
