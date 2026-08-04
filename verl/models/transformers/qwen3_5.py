@@ -230,7 +230,7 @@ def forward_with_torch_backend(
         vocab_weights = vocab_weights.full_tensor()
 
     ulysses_sequence_parallel_size = get_ulysses_sequence_parallel_world_size()
-    if ulysses_sequence_parallel_size > 1:
+    if shift_labels is None and ulysses_sequence_parallel_size > 1:
         rolled_labels, _, _ = ulysses_pad_and_slice_inputs(
             rolled_labels, position_ids_rmpad=None, sp_size=ulysses_sequence_parallel_size
         )
@@ -272,7 +272,7 @@ def forward_with_triton_backend(
     else:
         raise RuntimeError("To use forward_with_triton_backend, either labels or input_ids must be provided.")
     ulysses_sequence_parallel_size = get_ulysses_sequence_parallel_world_size()
-    if ulysses_sequence_parallel_size > 1:
+    if shift_labels is None and ulysses_sequence_parallel_size > 1:
         rolled_labels, _, _ = ulysses_pad_and_slice_inputs(
             rolled_labels, position_ids_rmpad=None, sp_size=ulysses_sequence_parallel_size
         )
