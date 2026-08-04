@@ -553,6 +553,10 @@ class FSDPEngine(BaseEngine):
         if self._qat_enabled and not self.engine_config.forward_only:
             module = self._apply_qat(module)
 
+        from .chalk_experiment import apply_chalk_experiment
+
+        self.chalk_report = apply_chalk_experiment(module, rank=self.rank)
+
         # Synchronize all distributed processes before proceeding
         torch.distributed.barrier()
         if self.rank == 0:
