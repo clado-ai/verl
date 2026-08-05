@@ -379,6 +379,8 @@ actor_rollout_ref:
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear
+    target_parameters: null
+    rank_pattern: null
     exclude_modules: null
     lora_adapter_path: null
     use_liger: false
@@ -583,6 +585,8 @@ critic:
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear
+    target_parameters: null
+    rank_pattern: null
     exclude_modules: null
     lora_adapter_path: null
     use_liger: false

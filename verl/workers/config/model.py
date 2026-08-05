@@ -125,6 +125,7 @@ class HFModelConfig(BaseConfig):
     lora_alpha: int = 16
     target_modules: Optional[Any] = "all-linear"  # allow both "all-linear" and ["q_proj","k_proj"]
     target_parameters: Optional[list[str]] = None  # for lora adapter on nn.Parameter
+    rank_pattern: Optional[dict[str, int]] = None  # per-target rank overrides
 
     exclude_modules: Optional[str] = None
 

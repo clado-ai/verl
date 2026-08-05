@@ -330,6 +330,7 @@ class FSDPEngine(BaseEngine):
                 "lora_alpha": self.model_config.lora_alpha,
                 "target_modules": convert_to_regular_types(self.model_config.target_modules),
                 "target_parameters": convert_to_regular_types(self.model_config.target_parameters),
+                "rank_pattern": convert_to_regular_types(self.model_config.rank_pattern),
                 "exclude_modules": convert_to_regular_types(self.model_config.exclude_modules),
                 "bias": "none",
             }

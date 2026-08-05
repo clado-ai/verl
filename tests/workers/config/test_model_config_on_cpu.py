@@ -82,6 +82,35 @@ class TestHFModelConfigCPU:
         merged = OmegaConf.merge(cfg_from_dataclass, cli_config)
         assert merged.target_modules == "all-linear"
 
+    def test_moe_parameter_targets_accept_rank_pattern_via_omegaconf(self):
+        """test fused moe parameter targets retain per-target rank overrides."""
+
+        cfg_from_dataclass = OmegaConf.structured(HFModelConfig)
+        cli_config = OmegaConf.create(
+            {
+                "path": self.model_path,
+                "target_parameters": [
+                    "mlp.experts.gate_up_proj",
+                    "mlp.experts.down_proj",
+                ],
+                "rank_pattern": {
+                    "experts.gate_up_proj": 1,
+                    "experts.down_proj": 1,
+                },
+            }
+        )
+
+        merged = OmegaConf.merge(cfg_from_dataclass, cli_config)
+
+        assert list(merged.target_parameters) == [
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        ]
+        assert dict(merged.rank_pattern) == {
+            "experts.gate_up_proj": 1,
+            "experts.down_proj": 1,
+        }
+
     def test_target_modules_raises_on_invalid_type(self):
         """Test that __post_init__ raises TypeError for invalid target_modules types."""
         base_config = OmegaConf.structured(HFModelConfig)

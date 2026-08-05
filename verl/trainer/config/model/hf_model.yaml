@@ -48,6 +48,12 @@ lora_alpha: 16
 # Target modules for LoRA adaptation
 target_modules: all-linear
 
+# direct parameter targets for fused moe expert weights
+target_parameters: null
+
+# per-target lora rank overrides
+rank_pattern: null
+
 # Exclude modules from LoRA adaptation
 exclude_modules: null
 
