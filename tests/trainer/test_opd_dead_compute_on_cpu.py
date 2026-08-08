@@ -53,11 +53,15 @@ def _trainer(
     *,
     rollout_correction=None,
     calculate_log_probs=False,
+    use_kl_in_reward=False,
 ):
     trainer = SimpleNamespace(
         config=_Cfg(
             distillation=distillation,
-            algorithm=_Cfg(rollout_correction=rollout_correction),
+            algorithm=_Cfg(
+                rollout_correction=rollout_correction,
+                use_kl_in_reward=use_kl_in_reward,
+            ),
             actor_rollout_ref=_Cfg(rollout=_Cfg(calculate_log_probs=calculate_log_probs)),
         ),
         distillation_config=SimpleNamespace(
@@ -132,6 +136,24 @@ def test_rollout_correction_is_counted_as_an_old_log_prob_consumer(
     )
 
     assert PPOTrainer._old_log_prob_has_consumer(trainer) is expected
+
+
+@pytest.mark.parametrize("use_kl_in_reward", [False, True])
+def test_in_reward_kl_penalty_is_counted_as_an_old_log_prob_consumer(use_kl_in_reward):
+    """`apply_kl_penalty` indexes old_log_probs unguarded, gated only on `use_kl_in_reward`.
+
+    Same shape as the rollout-correction hazard and independent of every loss-side term: the
+    penalty runs in the REWARD phase, so skipping the forward KeyErrors before the actor update
+    rather than after it. Nothing in the loss config can be read to infer this one.
+    """
+    trainer = _trainer(
+        SimpleNamespace(enabled=True),
+        False,
+        False,
+        use_kl_in_reward=use_kl_in_reward,
+    )
+
+    assert PPOTrainer._old_log_prob_has_consumer(trainer) is use_kl_in_reward
 
 
 def test_skipped_old_log_prob_returns_same_batch():

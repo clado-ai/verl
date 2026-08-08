@@ -1313,20 +1313,28 @@ class PPOTrainer:
         advantage phase would KeyError AFTER the actor update and checkpoint publication. It is a
         cheap reward-side reduction, so it stays.
 
-        Rollout correction is the OTHER reader, and it is the reason this cannot be a pure
-        loss-side test. Its own guard (see `fit`) admits the phase on `"rollout_log_probs" in
-        data.batch` and never mentions `old_log_probs`, but
-        `compute_rollout_correction_and_add_to_batch` then indexes `batch.batch["old_log_probs"]`
-        unguarded (`rollout_corr_helper.py:1043`). So a direct-distillation run that also sets
-        `rollout.calculate_log_probs=True` under the default non-null, non-bypass
-        `rollout_correction` would skip the forward and KeyError inside the correction phase --
-        before the actor update, unlike the `advantages` hazard above.
-        `tests/special_e2e/run_fully_async_policy_opd.sh` runs exactly that configuration.
+        Two REWARD-side readers are the reason this cannot be a pure loss-side test, and both fire
+        before the actor update rather than after it like the `advantages` hazard above:
+
+        * Rollout correction. Its own guard (see `fit`) admits the phase on `"rollout_log_probs" in
+          data.batch` and never mentions `old_log_probs`, but
+          `compute_rollout_correction_and_add_to_batch` then indexes `batch.batch["old_log_probs"]`
+          unguarded (`rollout_corr_helper.py:1043`). So a direct-distillation run that also sets
+          `rollout.calculate_log_probs=True` under the default non-null, non-bypass
+          `rollout_correction` would skip the forward and KeyError inside the correction phase.
+          `tests/special_e2e/run_fully_async_policy_opd.sh` runs exactly that configuration.
+        * The in-reward KL penalty. `apply_kl_penalty` indexes `data.batch["old_log_probs"]`
+          unguarded (`ray_trainer.py:98`) and its call site is gated ONLY on
+          `algorithm.use_kl_in_reward` (`main_ppo_sync.py:1478`), which is independent of every
+          loss-side term above. Default is False (`algorithm.py:655`) and flash's OPD leaves it
+          there, so the skip still fires on the path this optimization targets.
         """
         if not is_distillation_enabled(self.config.get("distillation")):
             return True
         loss_config = self.distillation_config.distillation_loss
         if loss_config.use_policy_gradient or loss_config.use_task_rewards:
+            return True
+        if self.config.algorithm.get("use_kl_in_reward", False):
             return True
         return self._rollout_correction_reads_old_log_prob()
 
