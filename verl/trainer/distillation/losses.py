@@ -162,27 +162,29 @@ def compute_topk_loss(
     return outputs
 
 
-def _entropy_only_metrics(config: ActorConfig, model_output: dict, data: TensorDict) -> dict:
-    """Publish `actor/entropy_loss` when the PPO loss is skipped but entropy was still computed.
+def _diagnostics_without_policy_loss(config: ActorConfig, model_output: dict, data: TensorDict) -> dict:
+    """Publish the `ppo_loss` metrics that do not depend on the policy gradient.
 
-    Mirrors the entropy block of `ppo_loss` exactly -- same `agg_loss` call, same aggregation rule
-    -- so the metric means the same thing whether or not task rewards are on. Deliberately does NOT
-    touch `old_log_probs` or `advantages`: those are what the skip exists to avoid.
+    `ppo_loss` is the only publisher of `actor/entropy_loss`, `kl_loss`, and `kl_coef`, and it used
+    to run unconditionally with only its scalar zeroed -- so all three were published regardless of
+    task rewards. Skipping the call is what dropped them; each is recomputed here from the same
+    inputs and the same `agg_loss` call, so the values mean exactly what they did before.
 
-    Returns an empty dict when the worker did not compute entropy, which is the case unless
-    `actor.calculate_entropy` or a nonzero `entropy_coeff` asked for it.
+    Both are governed by config that is independent of task rewards (`actor.calculate_entropy` /
+    `entropy_coeff`, and `actor.use_kl_loss`), so the work happens either way -- the worker computes
+    entropy, and `need_reference_policy` runs the reference forward -- and only the reporting was
+    lost.
+
+    Deliberately does NOT touch `old_log_probs` or `advantages`: those are what the skip exists to
+    avoid, and neither metric needs them.
     """
     entropy = model_output.get("entropy", None)
-    if entropy is None:
+    wants_kl = bool(config.use_kl_loss)
+    if entropy is None and not wants_kl:
         return {}
+
     padded = data.select("response_mask").to_padded_tensor()
     response_mask = padded["response_mask"].to(bool)
-    entropy_loss = agg_loss(
-        loss_mat=no_padding_2_padding(entropy, data),
-        loss_mask=response_mask,
-        loss_agg_mode=config.loss_agg_mode,
-        **config.global_batch_info,
-    )
     # same rule as ppo_loss: a normalized loss is summed across ranks, a local mean is averaged.
     aggregation = (
         AggregationType.SUM
@@ -194,7 +196,33 @@ def _entropy_only_metrics(config: ActorConfig, model_output: dict, data: TensorD
         )
         else AggregationType.MEAN
     )
-    return {"actor/entropy_loss": Metric(value=entropy_loss, aggregation=aggregation)}
+
+    metrics: dict = {}
+    if entropy is not None:
+        entropy_loss = agg_loss(
+            loss_mat=no_padding_2_padding(entropy, data),
+            loss_mask=response_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            **config.global_batch_info,
+        )
+        metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=aggregation)
+
+    if wants_kl:
+        kld = kl_penalty(
+            logprob=no_padding_2_padding(model_output["log_probs"], data),
+            ref_logprob=data.select("ref_log_prob").to_padded_tensor()["ref_log_prob"],
+            kl_penalty=config.kl_loss_type,
+        )
+        kl_loss = agg_loss(
+            loss_mat=kld,
+            loss_mask=response_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            **config.global_batch_info,
+        )
+        metrics["kl_loss"] = Metric(value=kl_loss, aggregation=aggregation)
+        metrics["kl_coef"] = config.kl_loss_coef
+
+    return metrics
 
 
 def distillation_ppo_loss(
@@ -256,13 +284,12 @@ def distillation_ppo_loss(
         # no task reward: the policy loss is discarded below, so skip computing it entirely
         # rather than building its ratio/clip tensors and metrics and then zeroing the scalar.
         #
-        # entropy is the exception. `ppo_loss` is the only publisher of `actor/entropy_loss`, and
-        # the worker computes entropy whenever `actor.calculate_entropy` or a nonzero
-        # `entropy_coeff` is configured -- independently of task rewards. Dropping the call would
-        # therefore compute entropy on the GPU and silently discard the diagnostic a run explicitly
-        # asked for. It needs nothing the skip avoids (no old_log_probs, no advantages), so publish
-        # it here from the same aggregation `ppo_loss` uses.
-        policy_loss, policy_metrics = 0.0, _entropy_only_metrics(config, model_output, data)
+        # the DIAGNOSTICS are the exception. The base zeroed only the scalar and kept
+        # `policy_metrics`, so entropy and KL reporting survived; skipping the call is what dropped
+        # them. Both are configured independently of task rewards, so the underlying work still
+        # happens either way and only the reporting was lost. Neither needs anything the skip
+        # avoids, so both are republished here.
+        policy_loss, policy_metrics = 0.0, _diagnostics_without_policy_loss(config, model_output, data)
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)

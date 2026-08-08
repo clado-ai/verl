@@ -240,7 +240,9 @@ def test_skipped_old_log_prob_returns_same_batch():
 
 
 def _make_loss_inputs(use_task_rewards: bool):
-    config = SimpleNamespace(global_batch_info={}, loss_scale_factor=0.25)
+    # use_kl_loss defaults off: `_diagnostics_without_policy_loss` reads it on every skip, so the
+    # stub has to answer it even for tests that only care about the batch-info ordering.
+    config = SimpleNamespace(global_batch_info={}, loss_scale_factor=0.25, use_kl_loss=False)
     distillation_config = SimpleNamespace(
         distillation_loss=SimpleNamespace(
             use_task_rewards=use_task_rewards,
@@ -327,23 +329,32 @@ def test_distillation_ppo_loss_calls_ppo_only_for_task_rewards(use_task_rewards)
 
 
 @pytest.mark.parametrize("entropy_present", [False, True])
-def test_entropy_metric_survives_the_skipped_ppo_loss(entropy_present):
-    """`ppo_loss` is the ONLY publisher of `actor/entropy_loss`, so skipping it drops the metric.
+@pytest.mark.parametrize("use_kl_loss", [False, True])
+def test_diagnostics_survive_the_skipped_ppo_loss(entropy_present, use_kl_loss):
+    """`ppo_loss` is the ONLY publisher of `actor/entropy_loss`, `kl_loss`, and `kl_coef`.
 
-    The worker computes entropy whenever `actor.calculate_entropy` or a nonzero `entropy_coeff` is
-    set, independently of task rewards -- so without this the GPU does the entropy work and the
-    diagnostic the run asked for silently disappears. Before the skip landed, `ppo_loss` always ran
-    and published it, which makes this a regression rather than a pre-existing gap.
+    Before this branch, `ppo_loss` ran unconditionally and only its SCALAR was zeroed --
+    `policy_metrics` survived and was merged. Making the call conditional is what dropped all
+    three, so these are regressions rather than pre-existing gaps.
 
-    The `entropy_present=False` arm pins the other half: no entropy computed means no metric
-    invented.
+    Both families are configured independently of task rewards (`actor.calculate_entropy` /
+    `entropy_coeff`, and `actor.use_kl_loss` via `need_reference_policy`), so the GPU work happens
+    either way -- entropy is computed, the reference forward runs -- and only the reporting was
+    lost. The negative arms pin the other half: no work done means no metric invented.
     """
     config, distillation_config, model_output, data = _make_loss_inputs(use_task_rewards=False)
     config.loss_agg_mode = "token-mean"
+    config.use_kl_loss = use_kl_loss
+    config.kl_loss_type = "kl"
+    config.kl_loss_coef = 0.001
+    model_output["log_probs"] = torch.tensor([[-0.5, -0.25]])
     if entropy_present:
         model_output["entropy"] = torch.tensor([[0.5, 0.25]])
     tensor_data = TensorDict(
-        {"response_mask": torch.tensor([[1, 1]], dtype=torch.int32)},
+        {
+            "response_mask": torch.tensor([[1, 1]], dtype=torch.int32),
+            "ref_log_prob": torch.tensor([[-0.4, -0.3]]),
+        },
         batch_size=[1],
     )
     # the denominators are per-batch scalars, not per-row tensors, so they cannot be set as
@@ -353,7 +364,7 @@ def test_entropy_metric_survives_the_skipped_ppo_loss(entropy_present):
 
     with (
         patch.object(distillation_losses, "distillation_loss", return_value=(torch.tensor(2.0), {})),
-        patch.object(distillation_losses, "no_padding_2_padding", side_effect=lambda entropy, _data: entropy),
+        patch.object(distillation_losses, "no_padding_2_padding", side_effect=lambda tensor, _data: tensor),
         patch.object(distillation_losses, "ppo_loss") as ppo_loss,
     ):
         _loss, metrics = distillation_losses.distillation_ppo_loss(
@@ -365,3 +376,5 @@ def test_entropy_metric_survives_the_skipped_ppo_loss(entropy_present):
 
     ppo_loss.assert_not_called()
     assert ("actor/entropy_loss" in metrics) is entropy_present
+    assert ("kl_loss" in metrics) is use_kl_loss
+    assert ("kl_coef" in metrics) is use_kl_loss
