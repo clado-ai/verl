@@ -1299,35 +1299,54 @@ class PPOTrainer:
         metrics.update(global_balance_stats)
         return batch
 
-    def _old_log_prob_has_consumer(self) -> bool:
-        """Whether anything downstream reads `old_log_probs` this run.
+    def _old_log_prob_forward_is_needed(self) -> bool:
+        """Whether the `compute_log_prob` forward is needed this run, for ANY reason.
+
+        Deliberately NOT "does anything read `old_log_probs`". That framing was the original one and
+        it was wrong twice over: the forward is also a producer of SIDE EFFECTS, and callers that
+        need it need it whether or not they touch its return value. Each term below is one such
+        need, and every one of them raises BEFORE the actor update if the forward is skipped.
 
         Direct distillation (`use_policy_gradient=false`) backpropagates the distillation loss as a
         supervised loss and never reads `old_log_probs`; `use_task_rewards=false` additionally means
-        `ppo_loss`, the other reader, is not called. When both hold the proximal anchor has no
-        consumer and the forward that produces it is dead compute.
+        `ppo_loss`, the other reader, is not called. When both hold and nothing below applies, the
+        forward is dead compute.
 
-        `advantages` is deliberately NOT part of this condition. It has no loss-side reader in the
-        same configuration, but `_compute_metrics` selects it unconditionally and
-        `compute_data_metrics` indexes `batch.batch["advantages"]` with no guard, so skipping the
-        advantage phase would KeyError AFTER the actor update and checkpoint publication. It is a
-        cheap reward-side reduction, so it stays.
+        Readers of the tensor:
 
-        Two REWARD-side readers are the reason this cannot be a pure loss-side test, and both fire
-        before the actor update rather than after it like the `advantages` hazard above:
-
+        * `ppo_loss` / policy gradient -- the loss-side terms above.
         * Rollout correction. Its own guard (see `fit`) admits the phase on `"rollout_log_probs" in
           data.batch` and never mentions `old_log_probs`, but
           `compute_rollout_correction_and_add_to_batch` then indexes `batch.batch["old_log_probs"]`
-          unguarded (`rollout_corr_helper.py:1043`). So a direct-distillation run that also sets
-          `rollout.calculate_log_probs=True` under the default non-null, non-bypass
-          `rollout_correction` would skip the forward and KeyError inside the correction phase.
+          unguarded (`rollout_corr_helper.py:1043`).
           `tests/special_e2e/run_fully_async_policy_opd.sh` runs exactly that configuration.
         * The in-reward KL penalty. `apply_kl_penalty` indexes `data.batch["old_log_probs"]`
-          unguarded (`ray_trainer.py:98`) and its call site is gated ONLY on
-          `algorithm.use_kl_in_reward` (`main_ppo_sync.py:1478`), which is independent of every
-          loss-side term above. Default is False (`algorithm.py:655`) and flash's OPD leaves it
-          there, so the skip still fires on the path this optimization targets.
+          unguarded (`ray_trainer.py:98`), gated only on `algorithm.use_kl_in_reward`
+          (`main_ppo_sync.py:1478`). Default False (`algorithm.py:655`).
+
+        Needs that are not reads:
+
+        * R2 router replay. `compute_log_prob` carries `@_with_routing_replay_flag(enabled=True)`
+          (`engine_workers.py:643`), and both engines enter RECORD only on a forward_only call
+          (veomni `transformer_impl.py:444`, megatron `:662`). So THIS forward is the record phase.
+          `update_actor` carries the same decorator and enters REPLAY, which raises
+          `router_replay REPLAY: micro_batch missing 'routed_experts'` with an explicit no-silent-
+          fallback comment (veomni `:941`). Skipping the forward therefore breaks the actor update
+          itself. Nothing in this file names router replay, which is exactly why the reader-shaped
+          predicate missed it.
+        * Explicitly requested log-prob diagnostics. `calculate_debug_metrics(data)` runs under
+          `rollout.calculate_log_probs` (`:1426`) and is the train/rollout consistency check. A run
+          that asked for it should not silently get nothing while still paying to collect the
+          rollout-side logprobs.
+
+        `advantages` is deliberately NOT here. It has no loss-side reader in the same configuration,
+        but `_compute_metrics` selects it unconditionally and `compute_data_metrics` indexes
+        `batch.batch["advantages"]` with no guard, so skipping the advantage phase would KeyError
+        AFTER the actor update and checkpoint publication. It is a cheap reward-side reduction, so
+        it stays.
+
+        Flash's OPD path sets none of these (correction non-null but `calculate_log_probs=false`,
+        no in-reward KL, replay disabled), so the skip still fires where this optimization is aimed.
         """
         if not is_distillation_enabled(self.config.get("distillation")):
             return True
@@ -1336,31 +1355,48 @@ class PPOTrainer:
             return True
         if self.config.algorithm.get("use_kl_in_reward", False):
             return True
-        return self._rollout_correction_reads_old_log_prob()
+        if self._router_replay_records_on_this_forward():
+            return True
+        return self._calculate_log_probs_needs_this_forward()
 
-    def _rollout_correction_reads_old_log_prob(self) -> bool:
-        """Whether the rollout-correction phase will run and index `old_log_probs`.
+    def _calculate_log_probs_needs_this_forward(self) -> bool:
+        """Whether `rollout.calculate_log_probs` makes this forward necessary.
 
-        Mirrors the admission test in `fit`, with each term resolved from config rather than from a
-        batch that does not exist yet:
+        ONE flag, TWO independent needs, which is why they resolve together: it admits the
+        rollout-correction phase (`fit`'s `"rollout_log_probs" in data.batch` term -- the flag is
+        the only thing that produces the key, `agent_loop.py:527` and `:968`), and it gates
+        `calculate_debug_metrics` inside `_compute_old_log_prob` itself.
 
-        * `rollout_corr_config is not None` -- read directly. It is non-null by DEFAULT
-          (`ppo_trainer.yaml:40` composes the `rollout_correction` group), so this term alone would
-          make the skip unreachable.
-        * `"rollout_log_probs" in data.batch` -- stands in as `rollout.calculate_log_probs`, which
-          is the only thing that produces the key: the agent loop passes it as `logprobs=` to the
-          sampler (`agent_loop.py:527`) and emits `rollout_log_probs` only from what comes back
-          (`agent_loop.py:968`). Default is False (`rollout.yaml:228`), and flash's OPD sets it
-          false explicitly, so the skip still fires on the path this optimization targets.
-        * `not bypass_recomputing_logprobs` -- read directly. Bypass mode ASSIGNS `old_log_probs`
-          from `rollout_log_probs` rather than reading a recomputed one, so it is not a consumer.
+        Both vanish in BYPASS mode, so it is excluded rather than special-cased twice: correction
+        drops bypass explicitly (`not bypass_recomputing_logprobs`), and the bypass branch returns
+        before ever reaching the debug-metrics call. Bypass also assigns `old_log_probs` from
+        `rollout_log_probs` instead of recomputing, so it never needed the forward to begin with.
         """
+        if not self.config.actor_rollout_ref.rollout.get("calculate_log_probs", False):
+            return False
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-        if rollout_corr_config is None:
+        if rollout_corr_config is not None and rollout_corr_config.get("bypass_mode", False):
             return False
-        if rollout_corr_config.get("bypass_mode", False):
+        return True
+
+    def _router_replay_records_on_this_forward(self) -> bool:
+        """Whether R2 router replay uses this forward as its RECORD pass.
+
+        Resolved from the same per-strategy engine config the worker reads (`engine_workers.py:478-
+        484`). R3 records on the rollout path instead, and "disabled" records nowhere, so only R2
+        depends on this call.
+        """
+        actor_config = self.config.actor_rollout_ref.actor
+        strategy = actor_config.get("strategy", "")
+        if strategy not in ("megatron", "veomni"):
             return False
-        return bool(self.config.actor_rollout_ref.rollout.get("calculate_log_probs", False))
+        engine_config = actor_config.get(strategy, None)
+        if engine_config is None:
+            return False
+        router_replay = engine_config.get("router_replay", None)
+        if router_replay is None:
+            return False
+        return str(router_replay.get("mode", "disabled")) == "R2"
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
@@ -1371,7 +1407,7 @@ class PPOTrainer:
         # `return batch`, not a bare `return`: the caller REBINDS `batch` to this result
         # (`batch = self._compute_old_log_prob(batch, ...)`), so returning None drops the live
         # KVBatchMeta and the next phase dies on NoneType.
-        if not self._old_log_prob_has_consumer():
+        if not self._old_log_prob_forward_is_needed():
             return batch
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)

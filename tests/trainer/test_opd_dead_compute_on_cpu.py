@@ -54,7 +54,12 @@ def _trainer(
     rollout_correction=None,
     calculate_log_probs=False,
     use_kl_in_reward=False,
+    strategy="fsdp",
+    router_replay_mode=None,
 ):
+    actor = _Cfg(strategy=strategy)
+    if router_replay_mode is not None:
+        actor[strategy] = _Cfg(router_replay=_Cfg(mode=router_replay_mode))
     trainer = SimpleNamespace(
         config=_Cfg(
             distillation=distillation,
@@ -62,7 +67,10 @@ def _trainer(
                 rollout_correction=rollout_correction,
                 use_kl_in_reward=use_kl_in_reward,
             ),
-            actor_rollout_ref=_Cfg(rollout=_Cfg(calculate_log_probs=calculate_log_probs)),
+            actor_rollout_ref=_Cfg(
+                rollout=_Cfg(calculate_log_probs=calculate_log_probs),
+                actor=actor,
+            ),
         ),
         distillation_config=SimpleNamespace(
             distillation_loss=SimpleNamespace(
@@ -71,11 +79,12 @@ def _trainer(
             )
         ),
     )
-    # the tests call the unbound method with this stub as `self`, so the real helper has to be
+    # the tests call the unbound method with this stub as `self`, so the real helpers have to be
     # bound onto it -- otherwise the delegation resolves to nothing and every case errors rather
     # than exercising the branch under test.
-    trainer._rollout_correction_reads_old_log_prob = (
-        lambda: PPOTrainer._rollout_correction_reads_old_log_prob(trainer)
+    trainer._router_replay_records_on_this_forward = lambda: PPOTrainer._router_replay_records_on_this_forward(trainer)
+    trainer._calculate_log_probs_needs_this_forward = lambda: PPOTrainer._calculate_log_probs_needs_this_forward(
+        trainer
     )
     return trainer
 
@@ -89,16 +98,17 @@ def _trainer(
         (SimpleNamespace(enabled=True), False, False, False),
     ],
 )
-def test_old_log_prob_consumer_truth_table(
+def test_old_log_prob_forward_need_truth_table(
     distillation,
     use_policy_gradient,
     use_task_rewards,
     expected,
 ):
     """A wrong entry either drops an anchor read during actor update or retains a dead GPU forward in direct OPD."""
-    assert PPOTrainer._old_log_prob_has_consumer(
-        _trainer(distillation, use_policy_gradient, use_task_rewards)
-    ) is expected
+    assert (
+        PPOTrainer._old_log_prob_forward_is_needed(_trainer(distillation, use_policy_gradient, use_task_rewards))
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -115,13 +125,14 @@ def test_old_log_prob_consumer_truth_table(
         # bypass ASSIGNS old_log_probs from rollout_log_probs rather than reading a recomputed
         # one, so it does not consume the forward's output.
         ({"bypass_mode": True}, True, False),
-        # explicitly disabled correction cannot read anything.
-        (None, True, False),
+        # correction is off, so nothing READS old_log_probs -- and the forward is still needed.
+        # `calculate_log_probs` also gates calculate_debug_metrics inside _compute_old_log_prob,
+        # which is an independent need. This expectation was False while the predicate only asked
+        # about readers, which is exactly the case that silently dropped requested diagnostics.
+        (None, True, True),
     ],
 )
-def test_rollout_correction_is_counted_as_an_old_log_prob_consumer(
-    rollout_correction, calculate_log_probs, expected
-):
+def test_rollout_correction_keeps_the_old_log_prob_forward(rollout_correction, calculate_log_probs, expected):
     """Rollout correction reads `old_log_probs` without ever naming it in its own admission test.
 
     A loss-side-only consumer test looks correct -- direct distillation genuinely ignores the
@@ -135,11 +146,11 @@ def test_rollout_correction_is_counted_as_an_old_log_prob_consumer(
         calculate_log_probs=calculate_log_probs,
     )
 
-    assert PPOTrainer._old_log_prob_has_consumer(trainer) is expected
+    assert PPOTrainer._old_log_prob_forward_is_needed(trainer) is expected
 
 
 @pytest.mark.parametrize("use_kl_in_reward", [False, True])
-def test_in_reward_kl_penalty_is_counted_as_an_old_log_prob_consumer(use_kl_in_reward):
+def test_in_reward_kl_penalty_keeps_the_old_log_prob_forward(use_kl_in_reward):
     """`apply_kl_penalty` indexes old_log_probs unguarded, gated only on `use_kl_in_reward`.
 
     Same shape as the rollout-correction hazard and independent of every loss-side term: the
@@ -153,13 +164,74 @@ def test_in_reward_kl_penalty_is_counted_as_an_old_log_prob_consumer(use_kl_in_r
         use_kl_in_reward=use_kl_in_reward,
     )
 
-    assert PPOTrainer._old_log_prob_has_consumer(trainer) is use_kl_in_reward
+    assert PPOTrainer._old_log_prob_forward_is_needed(trainer) is use_kl_in_reward
+
+
+@pytest.mark.parametrize(
+    ("strategy", "router_replay_mode", "expected"),
+    [
+        # R2 RECORDS on this forward. `compute_log_prob` carries
+        # @_with_routing_replay_flag(enabled=True) and both engines enter RECORD only when
+        # forward_only (veomni transformer_impl.py:444, megatron :662). Skipping it leaves
+        # `update_actor` -- same decorator, REPLAY branch -- raising "micro_batch missing
+        # 'routed_experts'", so the actor update itself breaks.
+        ("veomni", "R2", True),
+        ("megatron", "R2", True),
+        # R3 records on the rollout path instead, so this forward is not its record pass.
+        ("veomni", "R3", False),
+        ("megatron", "disabled", False),
+        # fsdp exposes no router_replay config at all.
+        ("fsdp", None, False),
+    ],
+)
+def test_r2_router_replay_keeps_the_old_log_prob_forward(strategy, router_replay_mode, expected):
+    """The forward is also a PRODUCER of side effects, not only of `old_log_probs`.
+
+    Nothing in the trainer names router replay -- the coupling is a decorator on the worker method
+    plus a forward_only check inside the engine -- so a predicate shaped as "does anything read the
+    output" cannot see this one. That is why the predicate asks whether the forward is NEEDED.
+    """
+    trainer = _trainer(
+        SimpleNamespace(enabled=True),
+        False,
+        False,
+        strategy=strategy,
+        router_replay_mode=router_replay_mode,
+    )
+
+    assert PPOTrainer._old_log_prob_forward_is_needed(trainer) is expected
+
+
+@pytest.mark.parametrize(
+    ("calculate_log_probs", "rollout_correction", "expected"),
+    [
+        # explicitly requested train/rollout consistency diagnostics: calculate_debug_metrics runs
+        # under this flag inside _compute_old_log_prob itself, so skipping the forward silently
+        # drops the metrics the run asked for while still paying to collect rollout logprobs.
+        (True, None, True),
+        (False, None, False),
+        # bypass reaches neither need: correction excludes it explicitly and the bypass branch
+        # returns before the debug-metrics call.
+        (True, {"bypass_mode": True}, False),
+    ],
+)
+def test_requested_log_prob_diagnostics_keep_the_forward(calculate_log_probs, rollout_correction, expected):
+    """One flag, two independent needs (correction admission and debug metrics), minus bypass."""
+    trainer = _trainer(
+        SimpleNamespace(enabled=True),
+        False,
+        False,
+        calculate_log_probs=calculate_log_probs,
+        rollout_correction=rollout_correction,
+    )
+
+    assert PPOTrainer._old_log_prob_forward_is_needed(trainer) is expected
 
 
 def test_skipped_old_log_prob_returns_same_batch():
     """A bare return makes the caller rebind batch to None, then a later phase fails while reading batch.extra_info."""
     batch = object()
-    trainer = SimpleNamespace(_old_log_prob_has_consumer=lambda: False)
+    trainer = SimpleNamespace(_old_log_prob_forward_is_needed=lambda: False)
 
     result = PPOTrainer._compute_old_log_prob(trainer, batch, metrics={})
 
