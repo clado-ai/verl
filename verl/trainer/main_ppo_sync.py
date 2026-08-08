@@ -1312,11 +1312,47 @@ class PPOTrainer:
         `compute_data_metrics` indexes `batch.batch["advantages"]` with no guard, so skipping the
         advantage phase would KeyError AFTER the actor update and checkpoint publication. It is a
         cheap reward-side reduction, so it stays.
+
+        Rollout correction is the OTHER reader, and it is the reason this cannot be a pure
+        loss-side test. Its own guard (see `fit`) admits the phase on `"rollout_log_probs" in
+        data.batch` and never mentions `old_log_probs`, but
+        `compute_rollout_correction_and_add_to_batch` then indexes `batch.batch["old_log_probs"]`
+        unguarded (`rollout_corr_helper.py:1043`). So a direct-distillation run that also sets
+        `rollout.calculate_log_probs=True` under the default non-null, non-bypass
+        `rollout_correction` would skip the forward and KeyError inside the correction phase --
+        before the actor update, unlike the `advantages` hazard above.
+        `tests/special_e2e/run_fully_async_policy_opd.sh` runs exactly that configuration.
         """
         if not is_distillation_enabled(self.config.get("distillation")):
             return True
         loss_config = self.distillation_config.distillation_loss
-        return bool(loss_config.use_policy_gradient or loss_config.use_task_rewards)
+        if loss_config.use_policy_gradient or loss_config.use_task_rewards:
+            return True
+        return self._rollout_correction_reads_old_log_prob()
+
+    def _rollout_correction_reads_old_log_prob(self) -> bool:
+        """Whether the rollout-correction phase will run and index `old_log_probs`.
+
+        Mirrors the admission test in `fit`, with each term resolved from config rather than from a
+        batch that does not exist yet:
+
+        * `rollout_corr_config is not None` -- read directly. It is non-null by DEFAULT
+          (`ppo_trainer.yaml:40` composes the `rollout_correction` group), so this term alone would
+          make the skip unreachable.
+        * `"rollout_log_probs" in data.batch` -- stands in as `rollout.calculate_log_probs`, which
+          is the only thing that produces the key: the agent loop passes it as `logprobs=` to the
+          sampler (`agent_loop.py:527`) and emits `rollout_log_probs` only from what comes back
+          (`agent_loop.py:968`). Default is False (`rollout.yaml:228`), and flash's OPD sets it
+          false explicitly, so the skip still fires on the path this optimization targets.
+        * `not bypass_recomputing_logprobs` -- read directly. Bypass mode ASSIGNS `old_log_probs`
+          from `rollout_log_probs` rather than reading a recomputed one, so it is not a consumer.
+        """
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        if rollout_corr_config is None:
+            return False
+        if rollout_corr_config.get("bypass_mode", False):
+            return False
+        return bool(self.config.actor_rollout_ref.rollout.get("calculate_log_probs", False))
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""

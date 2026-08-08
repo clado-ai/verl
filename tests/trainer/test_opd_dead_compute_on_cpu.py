@@ -32,6 +32,50 @@ import verl.workers.utils.losses as worker_losses
 from verl.trainer.main_ppo_sync import PPOTrainer
 
 
+class _Cfg(dict):
+    """A dict that also exposes its keys as attributes, like the OmegaConf the trainer really gets.
+
+    The trainer reads `config.get("distillation")` AND `config.algorithm...` off the same object,
+    so a stub has to answer both.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as e:
+            raise AttributeError(name) from e
+
+
+def _trainer(
+    distillation,
+    use_policy_gradient,
+    use_task_rewards,
+    *,
+    rollout_correction=None,
+    calculate_log_probs=False,
+):
+    trainer = SimpleNamespace(
+        config=_Cfg(
+            distillation=distillation,
+            algorithm=_Cfg(rollout_correction=rollout_correction),
+            actor_rollout_ref=_Cfg(rollout=_Cfg(calculate_log_probs=calculate_log_probs)),
+        ),
+        distillation_config=SimpleNamespace(
+            distillation_loss=SimpleNamespace(
+                use_policy_gradient=use_policy_gradient,
+                use_task_rewards=use_task_rewards,
+            )
+        ),
+    )
+    # the tests call the unbound method with this stub as `self`, so the real helper has to be
+    # bound onto it -- otherwise the delegation resolves to nothing and every case errors rather
+    # than exercising the branch under test.
+    trainer._rollout_correction_reads_old_log_prob = (
+        lambda: PPOTrainer._rollout_correction_reads_old_log_prob(trainer)
+    )
+    return trainer
+
+
 @pytest.mark.parametrize(
     ("distillation", "use_policy_gradient", "use_task_rewards", "expected"),
     [
@@ -48,14 +92,43 @@ def test_old_log_prob_consumer_truth_table(
     expected,
 ):
     """A wrong entry either drops an anchor read during actor update or retains a dead GPU forward in direct OPD."""
-    trainer = SimpleNamespace(
-        config={"distillation": distillation},
-        distillation_config=SimpleNamespace(
-            distillation_loss=SimpleNamespace(
-                use_policy_gradient=use_policy_gradient,
-                use_task_rewards=use_task_rewards,
-            )
-        ),
+    assert PPOTrainer._old_log_prob_has_consumer(
+        _trainer(distillation, use_policy_gradient, use_task_rewards)
+    ) is expected
+
+
+@pytest.mark.parametrize(
+    ("rollout_correction", "calculate_log_probs", "expected"),
+    [
+        # the config the skip targets: correction composed by default, but no rollout logprobs
+        # exist, so `fit`'s `"rollout_log_probs" in data.batch` term is false and the phase is
+        # never admitted. the forward stays skippable.
+        ({"bypass_mode": False}, False, False),
+        # THE REGRESSION. correction runs and indexes batch["old_log_probs"]
+        # (rollout_corr_helper.py:1043) while its own guard only ever checks rollout_log_probs.
+        # skipping the forward here KeyErrors before the actor update.
+        ({"bypass_mode": False}, True, True),
+        # bypass ASSIGNS old_log_probs from rollout_log_probs rather than reading a recomputed
+        # one, so it does not consume the forward's output.
+        ({"bypass_mode": True}, True, False),
+        # explicitly disabled correction cannot read anything.
+        (None, True, False),
+    ],
+)
+def test_rollout_correction_is_counted_as_an_old_log_prob_consumer(
+    rollout_correction, calculate_log_probs, expected
+):
+    """Rollout correction reads `old_log_probs` without ever naming it in its own admission test.
+
+    A loss-side-only consumer test looks correct -- direct distillation genuinely ignores the
+    proximal anchor -- and still removes a tensor this phase indexes one call earlier.
+    """
+    trainer = _trainer(
+        SimpleNamespace(enabled=True),
+        False,
+        False,
+        rollout_correction=rollout_correction,
+        calculate_log_probs=calculate_log_probs,
     )
 
     assert PPOTrainer._old_log_prob_has_consumer(trainer) is expected
