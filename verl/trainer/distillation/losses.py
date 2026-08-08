@@ -209,8 +209,10 @@ def distillation_ppo_loss(
     # BEFORE distillation_loss: it aggregates through `config.global_batch_info`, and `ppo_loss` was
     # the only writer -- so on the first micro-batch the dict was still empty and on every later one
     # it held the PREVIOUS micro-batch's denominators. agg_loss raises outright when dp_size > 1 and
-    # the matching term is missing. Publishing here makes the normalization correct for both
-    # branches and independent of whether task rewards are on.
+    # the matching term is missing. Neither built-in loss mode (forward_kl_topk, the reverse-KL
+    # estimators) publishes it, so both were exposed; an out-of-tree mode that publishes it itself
+    # is simply overwritten with the same values. Publishing here makes the normalization correct
+    # for every mode and independent of whether task rewards are on.
     set_global_batch_info(config, data)
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
     if distillation_loss_config.use_task_rewards:
