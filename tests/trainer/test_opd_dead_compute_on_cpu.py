@@ -26,6 +26,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 import verl.trainer.distillation.losses as distillation_losses
 import verl.workers.utils.losses as worker_losses
@@ -323,3 +324,44 @@ def test_distillation_ppo_loss_calls_ppo_only_for_task_rewards(use_task_rewards)
     else:
         ppo_loss.assert_not_called()
         torch.testing.assert_close(loss, torch.tensor(2.0))
+
+
+@pytest.mark.parametrize("entropy_present", [False, True])
+def test_entropy_metric_survives_the_skipped_ppo_loss(entropy_present):
+    """`ppo_loss` is the ONLY publisher of `actor/entropy_loss`, so skipping it drops the metric.
+
+    The worker computes entropy whenever `actor.calculate_entropy` or a nonzero `entropy_coeff` is
+    set, independently of task rewards -- so without this the GPU does the entropy work and the
+    diagnostic the run asked for silently disappears. Before the skip landed, `ppo_loss` always ran
+    and published it, which makes this a regression rather than a pre-existing gap.
+
+    The `entropy_present=False` arm pins the other half: no entropy computed means no metric
+    invented.
+    """
+    config, distillation_config, model_output, data = _make_loss_inputs(use_task_rewards=False)
+    config.loss_agg_mode = "token-mean"
+    if entropy_present:
+        model_output["entropy"] = torch.tensor([[0.5, 0.25]])
+    tensor_data = TensorDict(
+        {"response_mask": torch.tensor([[1, 1]], dtype=torch.int32)},
+        batch_size=[1],
+    )
+    # the denominators are per-batch scalars, not per-row tensors, so they cannot be set as
+    # batched entries on a batch_size=[1] TensorDict.
+    for key, value in data.items():
+        tensor_data.set_non_tensor(key, value)
+
+    with (
+        patch.object(distillation_losses, "distillation_loss", return_value=(torch.tensor(2.0), {})),
+        patch.object(distillation_losses, "no_padding_2_padding", side_effect=lambda entropy, _data: entropy),
+        patch.object(distillation_losses, "ppo_loss") as ppo_loss,
+    ):
+        _loss, metrics = distillation_losses.distillation_ppo_loss(
+            config=config,
+            distillation_config=distillation_config,
+            model_output=model_output,
+            data=tensor_data,
+        )
+
+    ppo_loss.assert_not_called()
+    assert ("actor/entropy_loss" in metrics) is entropy_present

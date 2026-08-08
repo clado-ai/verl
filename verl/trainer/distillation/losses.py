@@ -162,6 +162,41 @@ def compute_topk_loss(
     return outputs
 
 
+def _entropy_only_metrics(config: ActorConfig, model_output: dict, data: TensorDict) -> dict:
+    """Publish `actor/entropy_loss` when the PPO loss is skipped but entropy was still computed.
+
+    Mirrors the entropy block of `ppo_loss` exactly -- same `agg_loss` call, same aggregation rule
+    -- so the metric means the same thing whether or not task rewards are on. Deliberately does NOT
+    touch `old_log_probs` or `advantages`: those are what the skip exists to avoid.
+
+    Returns an empty dict when the worker did not compute entropy, which is the case unless
+    `actor.calculate_entropy` or a nonzero `entropy_coeff` asked for it.
+    """
+    entropy = model_output.get("entropy", None)
+    if entropy is None:
+        return {}
+    padded = data.select("response_mask").to_padded_tensor()
+    response_mask = padded["response_mask"].to(bool)
+    entropy_loss = agg_loss(
+        loss_mat=no_padding_2_padding(entropy, data),
+        loss_mask=response_mask,
+        loss_agg_mode=config.loss_agg_mode,
+        **config.global_batch_info,
+    )
+    # same rule as ppo_loss: a normalized loss is summed across ranks, a local mean is averaged.
+    aggregation = (
+        AggregationType.SUM
+        if (
+            data["dp_size"] > 1
+            or data["batch_num_tokens"] is not None
+            or data["global_batch_size"] is not None
+            or config.loss_scale_factor is not None
+        )
+        else AggregationType.MEAN
+    )
+    return {"actor/entropy_loss": Metric(value=entropy_loss, aggregation=aggregation)}
+
+
 def distillation_ppo_loss(
     config: ActorConfig,
     distillation_config: Optional[DistillationConfig],
@@ -220,7 +255,14 @@ def distillation_ppo_loss(
     else:
         # no task reward: the policy loss is discarded below, so skip computing it entirely
         # rather than building its ratio/clip tensors and metrics and then zeroing the scalar.
-        policy_loss, policy_metrics = 0.0, {}
+        #
+        # entropy is the exception. `ppo_loss` is the only publisher of `actor/entropy_loss`, and
+        # the worker computes entropy whenever `actor.calculate_entropy` or a nonzero
+        # `entropy_coeff` is configured -- independently of task rewards. Dropping the call would
+        # therefore compute entropy on the GPU and silently discard the diagnostic a run explicitly
+        # asked for. It needs nothing the skip avoids (no old_log_probs, no advantages), so publish
+        # it here from the same aggregation `ppo_loss` uses.
+        policy_loss, policy_metrics = 0.0, _entropy_only_metrics(config, model_output, data)
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
