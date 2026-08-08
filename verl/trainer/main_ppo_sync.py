@@ -1299,12 +1299,36 @@ class PPOTrainer:
         metrics.update(global_balance_stats)
         return batch
 
+    def _old_log_prob_has_consumer(self) -> bool:
+        """Whether anything downstream reads `old_log_probs` this run.
+
+        Direct distillation (`use_policy_gradient=false`) backpropagates the distillation loss as a
+        supervised loss and never reads `old_log_probs`; `use_task_rewards=false` additionally means
+        `ppo_loss`, the other reader, is not called. When both hold the proximal anchor has no
+        consumer and the forward that produces it is dead compute.
+
+        `advantages` is deliberately NOT part of this condition. It has no loss-side reader in the
+        same configuration, but `_compute_metrics` selects it unconditionally and
+        `compute_data_metrics` indexes `batch.batch["advantages"]` with no guard, so skipping the
+        advantage phase would KeyError AFTER the actor update and checkpoint publication. It is a
+        cheap reward-side reduction, so it stays.
+        """
+        if not is_distillation_enabled(self.config.get("distillation")):
+            return True
+        loss_config = self.distillation_config.distillation_loss
+        return bool(loss_config.use_policy_gradient or loss_config.use_task_rewards)
+
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
         # Operating Mode Selection:
         # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
         # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
         #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+        # `return batch`, not a bare `return`: the caller REBINDS `batch` to this result
+        # (`batch = self._compute_old_log_prob(batch, ...)`), so returning None drops the live
+        # KVBatchMeta and the next phase dies on NoneType.
+        if not self._old_log_prob_has_consumer():
+            return batch
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
         if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
@@ -1737,6 +1761,11 @@ class PPOTrainer:
                 batch = self._compute_values(batch, metrics=metrics)
 
         # 8. compute advantage and return
+        # NOT gated alongside the old_log_prob anchor even though direct distillation's loss reads
+        # neither: `_compute_metrics` selects `advantages`/`returns` and `compute_data_metrics`
+        # indexes them with no guard, so skipping this would KeyError after the actor update. It
+        # tolerates the missing anchor -- `kv_batch_get` omits absent fields rather than raising,
+        # and the GRPO estimator reads only token_level_rewards/response_mask/uid.
         with marked_timer("adv", timing_raw, color="brown"):
             batch = self._compute_advantage(batch, metrics=metrics)
 

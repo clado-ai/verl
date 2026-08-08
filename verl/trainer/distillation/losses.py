@@ -22,7 +22,7 @@ from verl.base_config import BaseConfig
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
-from verl.workers.utils.losses import ppo_loss
+from verl.workers.utils.losses import ppo_loss, set_global_batch_info
 from verl.workers.utils.padding import no_padding_2_padding
 
 DistillationLossFn = Callable[
@@ -206,10 +206,19 @@ def distillation_ppo_loss(
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
+    # BEFORE distillation_loss: it aggregates through `config.global_batch_info`, and `ppo_loss` was
+    # the only writer -- so on the first micro-batch the dict was still empty and on every later one
+    # it held the PREVIOUS micro-batch's denominators. agg_loss raises outright when dp_size > 1 and
+    # the matching term is missing. Publishing here makes the normalization correct for both
+    # branches and independent of whether task rewards are on.
+    set_global_batch_info(config, data)
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
-    policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
-    if not distillation_loss_config.use_task_rewards:
-        policy_loss = 0.0
+    if distillation_loss_config.use_task_rewards:
+        policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+    else:
+        # no task reward: the policy loss is discarded below, so skip computing it entirely
+        # rather than building its ratio/clip tensors and metrics and then zeroing the scalar.
+        policy_loss, policy_metrics = 0.0, {}
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
