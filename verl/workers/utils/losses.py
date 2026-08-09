@@ -54,6 +54,22 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {}
 
 
+def set_global_batch_info(config: ActorConfig, data: TensorDict) -> None:
+    """Publish this micro-batch's global normalization terms onto ``config.global_batch_info``.
+
+    ``agg_loss`` divides by these to keep the loss invariant to the dp/sp split, and it RAISES when
+    ``dp_size > 1`` and the matching denominator is absent. The engine assigns all three onto
+    ``data`` in ``forward_backward_batch`` before micro-batching, so every loss entry point can
+    publish them; each one must do so before it aggregates, because the dict is carried on the
+    config and would otherwise hold the PREVIOUS micro-batch's values (or nothing at all on the
+    first).
+    """
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
+
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
@@ -62,10 +78,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         entropy = no_padding_2_padding(entropy, data)
 
     # global batch info for loss aggregation
-    config.global_batch_info["dp_size"] = data["dp_size"]
-    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
-    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
-    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+    set_global_batch_info(config, data)
 
     # assumes that if any of the global batch info is set, the policy_loss_fn will
     # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM

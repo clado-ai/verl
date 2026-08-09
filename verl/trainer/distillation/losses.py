@@ -22,7 +22,7 @@ from verl.base_config import BaseConfig
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
-from verl.workers.utils.losses import ppo_loss
+from verl.workers.utils.losses import ppo_loss, set_global_batch_info
 from verl.workers.utils.padding import no_padding_2_padding
 
 DistillationLossFn = Callable[
@@ -162,6 +162,69 @@ def compute_topk_loss(
     return outputs
 
 
+def _diagnostics_without_policy_loss(config: ActorConfig, model_output: dict, data: TensorDict) -> dict:
+    """Publish the `ppo_loss` metrics that do not depend on the policy gradient.
+
+    `ppo_loss` is the only publisher of `actor/entropy_loss`, `kl_loss`, and `kl_coef`, and it used
+    to run unconditionally with only its scalar zeroed -- so all three were published regardless of
+    task rewards. Skipping the call is what dropped them; each is recomputed here from the same
+    inputs and the same `agg_loss` call, so the values mean exactly what they did before.
+
+    Both are governed by config that is independent of task rewards (`actor.calculate_entropy` /
+    `entropy_coeff`, and `actor.use_kl_loss`), so the work happens either way -- the worker computes
+    entropy, and `need_reference_policy` runs the reference forward -- and only the reporting was
+    lost.
+
+    Deliberately does NOT touch `old_log_probs` or `advantages`: those are what the skip exists to
+    avoid, and neither metric needs them.
+    """
+    entropy = model_output.get("entropy", None)
+    wants_kl = bool(config.use_kl_loss)
+    if entropy is None and not wants_kl:
+        return {}
+
+    padded = data.select("response_mask").to_padded_tensor()
+    response_mask = padded["response_mask"].to(bool)
+    # same rule as ppo_loss: a normalized loss is summed across ranks, a local mean is averaged.
+    aggregation = (
+        AggregationType.SUM
+        if (
+            data["dp_size"] > 1
+            or data["batch_num_tokens"] is not None
+            or data["global_batch_size"] is not None
+            or config.loss_scale_factor is not None
+        )
+        else AggregationType.MEAN
+    )
+
+    metrics: dict = {}
+    if entropy is not None:
+        entropy_loss = agg_loss(
+            loss_mat=no_padding_2_padding(entropy, data),
+            loss_mask=response_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            **config.global_batch_info,
+        )
+        metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=aggregation)
+
+    if wants_kl:
+        kld = kl_penalty(
+            logprob=no_padding_2_padding(model_output["log_probs"], data),
+            ref_logprob=data.select("ref_log_prob").to_padded_tensor()["ref_log_prob"],
+            kl_penalty=config.kl_loss_type,
+        )
+        kl_loss = agg_loss(
+            loss_mat=kld,
+            loss_mask=response_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            **config.global_batch_info,
+        )
+        metrics["kl_loss"] = Metric(value=kl_loss, aggregation=aggregation)
+        metrics["kl_coef"] = config.kl_loss_coef
+
+    return metrics
+
+
 def distillation_ppo_loss(
     config: ActorConfig,
     distillation_config: Optional[DistillationConfig],
@@ -206,10 +269,27 @@ def distillation_ppo_loss(
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
+    # BEFORE distillation_loss: it aggregates through `config.global_batch_info`, and `ppo_loss` was
+    # the only writer -- so on the first micro-batch the dict was still empty and on every later one
+    # it held the PREVIOUS micro-batch's denominators. agg_loss raises outright when dp_size > 1 and
+    # the matching term is missing. Neither built-in loss mode (forward_kl_topk, the reverse-KL
+    # estimators) publishes it, so both were exposed; an out-of-tree mode that publishes it itself
+    # is simply overwritten with the same values. Publishing here makes the normalization correct
+    # for every mode and independent of whether task rewards are on.
+    set_global_batch_info(config, data)
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
-    policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
-    if not distillation_loss_config.use_task_rewards:
-        policy_loss = 0.0
+    if distillation_loss_config.use_task_rewards:
+        policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+    else:
+        # no task reward: the policy loss is discarded below, so skip computing it entirely
+        # rather than building its ratio/clip tensors and metrics and then zeroing the scalar.
+        #
+        # the DIAGNOSTICS are the exception. The base zeroed only the scalar and kept
+        # `policy_metrics`, so entropy and KL reporting survived; skipping the call is what dropped
+        # them. Both are configured independently of task rewards, so the underlying work still
+        # happens either way and only the reporting was lost. Neither needs anything the skip
+        # avoids, so both are republished here.
+        policy_loss, policy_metrics = 0.0, _diagnostics_without_policy_loss(config, model_output, data)
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
