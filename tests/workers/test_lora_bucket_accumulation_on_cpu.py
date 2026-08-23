@@ -154,17 +154,22 @@ def _bucket_metadata(entries, is_last, buffer_dtype=torch.float32):
     }
 
 
-def _drive_receiver(buffer, bucket_metadata, on_bucket_received):
-    """Run the real ``BucketedWeightReceiver.receive_weights`` over a scripted socket."""
+def _scripted_receiver(buffer, script, socket_factory=_FakeSocket):
+    """A real ``BucketedWeightReceiver`` whose socket replays ``script`` over ``buffer``.
+
+    ``__new__`` plus explicit attributes rather than ``__init__``: the constructor opens a real ZMQ
+    context, and the socket/buffer handshake is what the script stands in for. Everything the test
+    exercises -- the receive loop, ``is_last``, cleanup -- is the production implementation.
+    """
     receiver = _TRANSFER.BucketedWeightReceiver.__new__(_TRANSFER.BucketedWeightReceiver)
     receiver.device = torch.device("cpu")
     receiver.use_shm = False
     receiver.shm = None
     receiver.buffer = buffer
-    receiver.socket = _FakeSocket(bucket_metadata)
+    receiver.socket = socket_factory(script)
     receiver._init_socket = lambda: None
     receiver._init_buffer = lambda: None
-    receiver.receive_weights(on_bucket_received=on_bucket_received)
+    return receiver
 
 
 def test_receiver_passes_is_last_to_callback():
@@ -182,12 +187,14 @@ def test_receiver_passes_is_last_to_callback():
     ]
     seen = []
 
-    _drive_receiver(buffer, script, lambda weights, is_last: seen.append(([n for n, _ in weights], is_last)))
+    _scripted_receiver(buffer, script).receive_weights(
+        on_bucket_received=lambda weights, is_last: seen.append(([n for n, _ in weights], is_last))
+    )
 
     assert seen == [(["a"], False), (["b"], False), (["c"], True)]
 
 
-def _make_worker(utils_module, *, peft_config, base_sync_done, buffer, script):
+def _make_worker(utils_module, *, peft_config, base_sync_done, buffer, script, socket_factory=_FakeSocket):
     """Build a minimal ``vLLMColocateWorkerExtension`` that runs the real update path on cpu.
 
     Only the attributes ``update_weights_from_ipc`` actually touches are provided, so the method
@@ -214,21 +221,14 @@ def _make_worker(utils_module, *, peft_config, base_sync_done, buffer, script):
             [name for name, _ in weights]
         )
 
-    def fake_receiver(zmq_handle, device, use_shm):
-        receiver = _TRANSFER.BucketedWeightReceiver.__new__(_TRANSFER.BucketedWeightReceiver)
-        receiver.device = torch.device("cpu")
-        receiver.use_shm = False
-        receiver.shm = None
-        receiver.buffer = buffer
-        receiver.socket = _FakeSocket(script)
-        receiver._init_socket = lambda: None
-        receiver._init_buffer = lambda: None
-        return receiver
-
+    # update_weights_from_ipc imports BucketedWeightReceiver from this path at call time, so
+    # substituting the module here decides which receiver the production method constructs.
     transfer_module = sys.modules["verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"] = types.ModuleType(
         "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
     )
-    transfer_module.BucketedWeightReceiver = fake_receiver
+    transfer_module.BucketedWeightReceiver = lambda zmq_handle, device, use_shm: _scripted_receiver(
+        buffer, script, socket_factory
+    )
     platforms = sys.modules["vllm.platforms"] = types.ModuleType("vllm.platforms")
     platforms.current_platform = types.SimpleNamespace(device_type="cuda")
     return worker, applied, base_applied
@@ -330,17 +330,14 @@ def test_accumulated_lora_tensors_survive_buffer_reuse(_restore_modules):
         _bucket_metadata([("first.weight", 0, torch.Size([2]))], is_last=False),
         _bucket_metadata([("second.weight", 0, torch.Size([2]))], is_last=True),
     ]
-    worker, applied, _ = _make_worker(_UTILS, peft_config={"r": 8}, base_sync_done=True, buffer=buffer, script=script)
-    original_receiver = sys.modules["verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"].BucketedWeightReceiver
-
-    def receiver_with_mutating_socket(zmq_handle, device, use_shm):
-        receiver = original_receiver(zmq_handle, device, use_shm)
-        receiver.socket = _MutatingSocket(script)
-        return receiver
-
-    sys.modules[
-        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
-    ].BucketedWeightReceiver = receiver_with_mutating_socket
+    worker, applied, _ = _make_worker(
+        _UTILS,
+        peft_config={"r": 8},
+        base_sync_done=True,
+        buffer=buffer,
+        script=script,
+        socket_factory=_MutatingSocket,
+    )
 
     worker.update_weights_from_ipc(peft_config={"r": 8}, base_sync_done=True)
 
