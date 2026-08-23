@@ -1,3 +1,17 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib.util
 import sys
 import types
@@ -16,6 +30,15 @@ def _load_qwen35_module():
     ulysses_module = types.ModuleType("verl.utils.ulysses")
     ulysses_module.get_ulysses_sequence_parallel_world_size = lambda: 1
     ulysses_module.ulysses_pad_and_slice_inputs = lambda labels, **_kwargs: (labels, None, 0)
+
+    # Import torch's lazy subsystems BEFORE the patch. `mock.patch.dict` restores the exact
+    # sys.modules snapshot it took, so anything imported inside the block is EVICTED on exit --
+    # including the ~90 `torch._dynamo` modules a first autograd/compile touch pulls in. The next
+    # test to import them re-executes `torch._inductor.test_operators`, which re-runs a
+    # TORCH_LIBRARY registration that may only happen once per process, and dies with
+    # "Only a single TORCH_LIBRARY can be used to register the namespace _inductor_test".
+    # Importing here pins them in the snapshot, so the restore keeps rather than drops them.
+    import torch._dynamo  # noqa: F401
 
     with mock.patch.dict(
         sys.modules,

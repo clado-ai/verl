@@ -72,7 +72,9 @@ jobs:
         run: |
           sed -i 's/--output-format=full/--output-format=github/' .pre-commit-config.yaml
           git add .pre-commit-config.yaml
-      - uses: pre-commit/action@v3.0.1
-        with:
-          extra_args: "" # Overriding default "--all-files"
-
+      # No "--all-files": check only the staged files, as the previous `extra_args: ""` did.
+      # Run pre-commit directly rather than through pre-commit/action -- that composite action
+      # uses `actions/cache@v4` internally, and this org requires every action pinned to a
+      # full-length SHA, so the job is refused at setup before any step runs.
+      - name: Run pre-commit
+        run: pre-commit run --show-diff-on-failure --color=always

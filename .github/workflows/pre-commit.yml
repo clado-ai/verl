@@ -37,5 +37,9 @@ jobs:
         run: |
           sed -i 's/--output-format=full/--output-format=github/' .pre-commit-config.yaml
           git add .pre-commit-config.yaml
-      # Check "--all-files" by default
-      - uses: pre-commit/action@v3.0.1
+      # Check "--all-files" by default. Run pre-commit directly rather than through
+      # pre-commit/action: that composite action uses `actions/cache@v4` internally, and this org
+      # requires every action pinned to a full-length SHA, so the job is refused at setup before
+      # any step runs. The action only wraps this one command, and pre-commit is installed above.
+      - name: Run pre-commit
+        run: pre-commit run --show-diff-on-failure --color=always --all-files

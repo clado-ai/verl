@@ -234,11 +234,30 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
-        receiver.receive_weights(
-            on_bucket_received=lambda weights: self._update_weights(
-                weights, peft_config=peft_config, base_sync_done=base_sync_done
-            )
-        )
+        # A lora adapter must reach ``add_lora`` as one complete tensor dict, but the bucketed
+        # transport splits the payload on a fixed byte budget
+        # (``rollout.update_weights_bucket_megabytes``, 512 by default) and knows nothing about
+        # adapter boundaries. Applying per bucket registers the same lora id several times, each
+        # holding a fraction of the tensors. A MoE adapter is not a corner case here: fused routed
+        # experts stack every expert slice on the rank axis, so a 35B-A3B adapter is GiB-scale and
+        # always spans several buckets. Accumulate, then apply once on the last bucket.
+        # Base (non-lora) weights stay per bucket -- they load by name and never need the whole set.
+        lora_weights: dict[str, torch.Tensor] | None = {} if (peft_config and base_sync_done) else None
+
+        def on_bucket_received(weights: list[tuple[str, torch.Tensor]], is_last: bool) -> None:
+            if lora_weights is None:
+                self._update_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
+                return
+            # Clone here, not in ``_update_weights``: these tensors are views into the receiver's
+            # reused bucket buffer, which the next bucket overwrites and ``_cleanup`` frees, while
+            # add_lora keeps its references well past this callback.
+            lora_weights.update((name, tensor.clone()) for name, tensor in weights)
+            if not is_last:
+                return
+            self._update_weights(list(lora_weights.items()), peft_config=peft_config, base_sync_done=base_sync_done)
+            lora_weights.clear()
+
+        receiver.receive_weights(on_bucket_received=on_bucket_received)
 
         if self._is_qat_model:
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
@@ -261,6 +280,12 @@ class vLLMColocateWorkerExtension:
 
     def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
         if peft_config and base_sync_done:
+            # NOTE: the caller owns lifetime here. ``add_lora`` keeps these tensors past this call,
+            # so whoever assembles them must not hand over views into the receiver's reused bucket
+            # buffer -- ``update_weights`` clones as it accumulates, for exactly that reason.
+            # Cloning again here would be a second full copy of the adapter while the first is
+            # still referenced, i.e. a 2x peak: a rank-128 fused-expert MoE adapter is ~14.5 GiB,
+            # so the redundant copy alone would cost that much device memory at the worst moment.
             weights = dict(weights)
             lora_request = TensorLoRARequest(
                 lora_name=VLLM_LORA_NAME,

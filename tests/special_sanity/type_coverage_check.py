@@ -20,20 +20,41 @@ find verl -type f -name "*.py" | xargs -n 1 python3 tests/special_sanity/type_co
 import argparse
 import ast
 import linecache
+import os
 import subprocess
 from pathlib import Path
 
 
+def get_diff_base() -> str:
+    """The ref this PR is actually branched from.
+
+    Hardcoding ``origin/main`` assumes every PR targets a branch by that name. This repo's default
+    is ``flash-0.8.0``, so the hardcoded ref either fails to resolve or -- worse -- silently
+    resolves to an unrelated lineage and reports files the PR never touched as changed.
+    ``GITHUB_BASE_REF`` is the pull request's real base branch, set by Actions on every
+    ``pull_request`` event; fall back to the repository's default branch when running locally.
+    """
+    base_ref = os.getenv("GITHUB_BASE_REF")
+    if base_ref:
+        return f"origin/{base_ref}"
+    result = subprocess.run(
+        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], stdout=subprocess.PIPE, text=True
+    )
+    return result.stdout.strip() or "origin/main"
+
+
 def get_changed_files() -> list[Path]:
     result = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=AM", "origin/main...HEAD"], stdout=subprocess.PIPE, text=True
+        ["git", "diff", "--name-only", "--diff-filter=AM", f"{get_diff_base()}...HEAD"],
+        stdout=subprocess.PIPE,
+        text=True,
     )
     return [Path(f) for f in result.stdout.splitlines() if f.endswith(".py")]
 
 
 def get_changed_lines(file_path: Path) -> set[int]:
     result = subprocess.run(
-        ["git", "diff", "-U0", "origin/main...HEAD", "--", str(file_path)],
+        ["git", "diff", "-U0", f"{get_diff_base()}...HEAD", "--", str(file_path)],
         stdout=subprocess.PIPE,
         text=True,
     )
