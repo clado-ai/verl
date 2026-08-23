@@ -127,3 +127,20 @@ def test_accumulated_lora_tensors_survive_buffer_reuse():
         "first bucket's tensor was overwritten by the second: it was a view, not a clone"
     )
     assert torch.equal(captured["second.weight"], torch.full((2, 2), 99.0))
+
+
+def test_lora_tensors_are_cloned_exactly_once():
+    """One clone, at accumulation. A second one in ``_update_weights`` would double peak memory.
+
+    The accumulated dict is already owned, so re-cloning it copies the WHOLE adapter again while
+    the first copy is still referenced. That is a 2x peak on a payload that is GiB-scale for a
+    fused-expert MoE adapter (~14.5 GiB at rank 128), which is device memory at the worst possible
+    moment. Ownership therefore belongs to the assembling caller, and ``_update_weights`` must
+    hand the dict straight to ``TensorLoRARequest``.
+    """
+    source = (Path(__file__).parents[2] / "verl/workers/rollout/vllm_rollout/utils.py").read_text()
+    update_weights_body = source.split("def _update_weights(")[1].split("def ")[0]
+    assert ".clone()" not in update_weights_body, (
+        "_update_weights must not re-clone: the caller already owns these tensors, and a second "
+        "copy of a GiB-scale adapter doubles peak memory"
+    )

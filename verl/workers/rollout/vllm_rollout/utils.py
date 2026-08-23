@@ -280,12 +280,13 @@ class vLLMColocateWorkerExtension:
 
     def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
         if peft_config and base_sync_done:
-            # ``add_lora`` holds these tensors past this call, so anything still pointing into the
-            # receiver's reused bucket buffer would be silently overwritten by the next bucket or
-            # freed with it. The accumulating caller above already cloned; ``clone()`` on an owned
-            # tensor is a cheap copy, and paying it here keeps every future caller safe by default
-            # rather than depending on which path built the dict.
-            weights = {name: tensor.clone() for name, tensor in dict(weights).items()}
+            # NOTE: the caller owns lifetime here. ``add_lora`` keeps these tensors past this call,
+            # so whoever assembles them must not hand over views into the receiver's reused bucket
+            # buffer -- ``update_weights`` clones as it accumulates, for exactly that reason.
+            # Cloning again here would be a second full copy of the adapter while the first is
+            # still referenced, i.e. a 2x peak: a rank-128 fused-expert MoE adapter is ~14.5 GiB,
+            # so the redundant copy alone would cost that much device memory at the worst moment.
+            weights = dict(weights)
             lora_request = TensorLoRARequest(
                 lora_name=VLLM_LORA_NAME,
                 lora_int_id=VLLM_LORA_INT_ID,
