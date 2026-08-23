@@ -104,7 +104,17 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
         if orig_ndim == 3:
             assert input_ids.ndim == 2, f"input_ids shape doesn't match, {hidden_states.shape} {input_ids.shape}"
             orig_batch_size = hidden_states.shape[0]
+            # Carry requires_grad across the flatten EXPLICITLY. Grad mode is off inside an
+            # autograd.Function.forward, so this only survives while flatten can return a view;
+            # on a non-contiguous input it copies and the flag is dropped. Everything downstream
+            # keys off the flattened tensor -- the backward allocates dhidden_states only
+            # `if hidden_states.requires_grad` -- so losing it here makes backward return None for
+            # the hidden-state gradient. With lora the lm_head is frozen, so that is the ONLY
+            # gradient path into the adapters: training silently becomes a no-op while the loss
+            # still looks healthy. Upstream verl fixes this the same way (volcengine/verl#6913).
+            hidden_states_requires_grad = hidden_states.requires_grad
             hidden_states = hidden_states.flatten(0, 1)
+            hidden_states.requires_grad_(hidden_states_requires_grad)
         input_ids = input_ids.flatten()
 
         T = hidden_states.shape[0]

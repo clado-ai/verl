@@ -17,6 +17,15 @@ def _load_qwen35_module():
     ulysses_module.get_ulysses_sequence_parallel_world_size = lambda: 1
     ulysses_module.ulysses_pad_and_slice_inputs = lambda labels, **_kwargs: (labels, None, 0)
 
+    # Import torch's lazy subsystems BEFORE the patch. `mock.patch.dict` restores the exact
+    # sys.modules snapshot it took, so anything imported inside the block is EVICTED on exit --
+    # including the ~90 `torch._dynamo` modules a first autograd/compile touch pulls in. The next
+    # test to import them re-executes `torch._inductor.test_operators`, which re-runs a
+    # TORCH_LIBRARY registration that may only happen once per process, and dies with
+    # "Only a single TORCH_LIBRARY can be used to register the namespace _inductor_test".
+    # Importing here pins them in the snapshot, so the restore keeps rather than drops them.
+    import torch._dynamo  # noqa: F401
+
     with mock.patch.dict(
         sys.modules,
         {
