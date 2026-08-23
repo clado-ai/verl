@@ -94,6 +94,35 @@ def _receiver_fn(zmq_handle, use_shm, result_queue):
     result_queue.put(summaries)
 
 
+def _accumulating_receiver_fn(zmq_handle, result_queue):
+    """Receive an adapter the way the lora path does: accumulate every bucket, read after cleanup.
+
+    This mirrors ``update_weights_from_ipc``'s callback, which holds the whole adapter until the
+    last bucket so ``add_lora`` gets one complete tensor dict. The tensors handed to the callback
+    are views into the receiver's communication buffer, which the sender refills for the next
+    bucket and ``_cleanup`` frees, so accumulating them without a copy leaves earlier buckets
+    aliasing whatever landed at the same offset later. Checksums are taken after
+    ``receive_weights`` returns -- i.e. after cleanup -- which is when a missing copy shows up.
+    """
+    from verl.utils.device import get_device_name
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+    device = torch.device(f"{get_device_name()}:0")
+    receiver = BucketedWeightReceiver(zmq_handle=zmq_handle, device=device, use_shm=False)
+
+    accumulated: dict[str, torch.Tensor] = {}
+    last_bucket_flags = []
+
+    def on_bucket_received(weights, is_last):
+        last_bucket_flags.append(is_last)
+        accumulated.update((name, tensor.clone()) for name, tensor in weights)
+
+    receiver.receive_weights(on_bucket_received=on_bucket_received)
+
+    summaries = [(name, t.dtype, tuple(t.shape), t.float().sum().item()) for name, t in accumulated.items()]
+    result_queue.put((summaries, last_bucket_flags))
+
+
 # ---------------------------------------------------------------------------
 # Test helper
 # ---------------------------------------------------------------------------
@@ -228,3 +257,50 @@ class TestBucketedWeightTransferIPC:
         specs.append(("lm_head", (1024, 1024), torch.float32))  # 4MB
 
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=False)
+
+    def test_adapter_accumulated_across_buckets_survives_buffer_reuse(self):
+        """A lora-style consumer holding every bucket must still hold the right bytes at the end.
+
+        The other tests in this class copy inside the callback and check each bucket as it lands,
+        so a tensor that goes stale once the buffer is refilled would still pass them. The lora
+        path cannot check per bucket: ``add_lora`` needs the whole adapter at once, so the earliest
+        bucket's tensors have to stay valid across every later bucket and past ``_cleanup``.
+
+        24 x 512 KB over a 1 MB bucket is 12 buckets, so all but the final bucket are read back
+        from a buffer that has since been overwritten. Distinct per-tensor content is what makes a
+        stale read visible: identical content would alias cleanly and hide the bug.
+        """
+        specs = [(f"lora_B.layer{i}.weight", (512, 256), torch.float32) for i in range(24)]
+
+        zmq_handle = _unique_zmq_handle()
+        seed = 7
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.Queue()
+        sender_p = ctx.Process(target=_sender_fn, args=(zmq_handle, specs, seed, 1, False))
+        receiver_p = ctx.Process(target=_accumulating_receiver_fn, args=(zmq_handle, result_queue))
+
+        sender_p.start()
+        receiver_p.start()
+        sender_p.join(timeout=PROCESS_TIMEOUT)
+        receiver_p.join(timeout=PROCESS_TIMEOUT)
+
+        assert sender_p.exitcode == 0, f"Sender process failed with exit code {sender_p.exitcode}"
+        assert receiver_p.exitcode == 0, f"Receiver process failed with exit code {receiver_p.exitcode}"
+
+        summaries, last_bucket_flags = result_queue.get(timeout=5)
+
+        # The payload must actually have been split, or this test proves nothing about reuse.
+        assert len(last_bucket_flags) > 1, f"Expected a multi-bucket transfer, got {len(last_bucket_flags)}"
+        assert last_bucket_flags[-1] is True
+        assert not any(last_bucket_flags[:-1]), "is_last must be set on the final bucket only"
+
+        expected = {name: tensor for name, tensor in _generate_weights(specs, seed)}
+        assert len(summaries) == len(expected)
+        for name, dtype, shape, checksum in summaries:
+            exp = expected[name]
+            assert tuple(exp.shape) == shape, f"Shape mismatch for {name}"
+            assert exp.dtype == dtype, f"Dtype mismatch for {name}"
+            assert exp.float().sum().item() == checksum, (
+                f"Data mismatch for {name}: an accumulated tensor went stale when the "
+                f"communication buffer was reused for a later bucket"
+            )
