@@ -263,7 +263,10 @@ class BucketedWeightReceiver:
         Receive weights from sender and process each bucket via callback.
 
         Args:
-            on_bucket_received: Callback function(weights: list[(name, tensor)]) called per bucket.
+            on_bucket_received: Callback function(weights: list[(name, tensor)], is_last: bool)
+                called per bucket. ``is_last`` marks the final bucket of the transfer, so a
+                consumer that needs the WHOLE payload at once (lora: one complete tensor dict
+                per ``add_lora``) can accumulate across buckets and apply on the last one.
         """
         try:
             self._init_socket()
@@ -284,11 +287,12 @@ class BucketedWeightReceiver:
                     if self.use_shm:
                         tensor = tensor.to(self.device)
                     weights.append((name, tensor))
-                on_bucket_received(weights)
+                is_last = bool(metadata["is_last"])
+                on_bucket_received(weights, is_last)
                 get_torch_device().synchronize()
                 self.socket.send(b"")
                 del weights, tensor
-                if metadata["is_last"]:
+                if is_last:
                     break
         finally:
             self._cleanup()
