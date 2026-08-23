@@ -234,7 +234,7 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
-        # A lora adapter must reach ``add_lora`` as ONE complete tensor dict, but the bucketed
+        # A lora adapter must reach ``add_lora`` as one complete tensor dict, but the bucketed
         # transport splits the payload on a fixed byte budget
         # (``rollout.update_weights_bucket_megabytes``, 512 by default) and knows nothing about
         # adapter boundaries. Applying per bucket registers the same lora id several times, each
@@ -249,7 +249,7 @@ class vLLMColocateWorkerExtension:
                 self._update_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
                 return
             # Clone here, not in ``_update_weights``: these tensors are views into the receiver's
-            # REUSED bucket buffer, which the next bucket overwrites and ``_cleanup`` frees, while
+            # reused bucket buffer, which the next bucket overwrites and ``_cleanup`` frees, while
             # add_lora keeps its references well past this callback.
             lora_weights.update((name, tensor.clone()) for name, tensor in weights)
             if not is_last:

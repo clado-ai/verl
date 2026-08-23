@@ -265,7 +265,7 @@ class BucketedWeightReceiver:
         Args:
             on_bucket_received: Callback function(weights: list[(name, tensor)], is_last: bool)
                 called per bucket. ``is_last`` marks the final bucket of the transfer, so a
-                consumer that needs the WHOLE payload at once (lora: one complete tensor dict
+                consumer that needs the whole payload at once (lora: one complete tensor dict
                 per ``add_lora``) can accumulate across buckets and apply on the last one.
         """
         try:

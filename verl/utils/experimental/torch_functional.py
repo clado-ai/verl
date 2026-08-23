@@ -109,7 +109,7 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
             # on a non-contiguous input it copies and the flag is dropped. Everything downstream
             # keys off the flattened tensor -- the backward allocates dhidden_states only
             # `if hidden_states.requires_grad` -- so losing it here makes backward return None for
-            # the hidden-state gradient. With lora the lm_head is frozen, so that is the ONLY
+            # the hidden-state gradient. With lora the lm_head is frozen, so that is the only
             # gradient path into the adapters: training silently becomes a no-op while the loss
             # still looks healthy. Upstream verl fixes this the same way (volcengine/verl#6913).
             hidden_states_requires_grad = hidden_states.requires_grad

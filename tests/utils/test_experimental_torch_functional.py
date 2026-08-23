@@ -42,7 +42,7 @@ def test_fused_linear_keeps_hidden_state_grad_path_with_frozen_lm_head(contiguou
     """Gradient must reach the trainable stack below a 3D hidden state, frozen lm_head included.
 
     This is the lora shape: peft's "all-linear" leaves lm_head frozen, so the hidden-state
-    gradient is the ONLY route back to the adapters. `flatten(0, 1)` inside the autograd
+    gradient is the only route back to the adapters. `flatten(0, 1)` inside the autograd
     forward runs with grad mode off, so it preserves requires_grad only while it can return a
     view; on a non-contiguous input it copies and drops the flag, backward then skips
     dhidden_states entirely and returns None, and training silently stops updating the adapter
